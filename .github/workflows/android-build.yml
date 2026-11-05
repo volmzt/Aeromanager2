@@ -1,0 +1,209 @@
+name: Android Build
+
+# Положите этот файл в .github/workflows/android-build.yml
+# В репозитории может лежать ZIP с проектом (например AeroManager-phase2.zip):
+# workflow сам найдёт его, распакует и соберёт APK.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Путь к ZIP в репозитории (пусто = найти автоматически)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_VERSION: '8.11.1'
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.release.outputs.signed }}
+      version: ${{ steps.version.outputs.name }}
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 1. Найти проект: распаковать ZIP или взять как есть ----------
+      - name: Locate project (unzip if needed)
+        id: prep
+        shell: bash
+        env:
+          ZIP_INPUT: ${{ github.event.inputs.zip_path }}
+        run: |
+          set -euo pipefail
+          WORK="$GITHUB_WORKSPACE/_aero_src"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+
+          ZIP=""
+          if [ -n "${ZIP_INPUT:-}" ]; then
+            if [ -f "$ZIP_INPUT" ]; then ZIP="$ZIP_INPUT"; else echo "::error::ZIP not found: $ZIP_INPUT"; exit 1; fi
+          else
+            ZIP="$(find . -maxdepth 3 -type f -iname '*.zip' -not -path './.git/*' -not -path './_aero_src/*' | sort -V | tail -n 1 || true)"
+          fi
+
+          if [ -n "$ZIP" ]; then
+            echo "Using ZIP: $ZIP"
+            sudo apt-get install -y -qq unzip >/dev/null 2>&1 || true
+            unzip -q -o "$ZIP" -d "$WORK"
+            SEARCH="$WORK"
+          elif [ -f settings.gradle.kts ] || [ -f settings.gradle ]; then
+            echo "No ZIP found, using project from repository root"
+            SEARCH="$GITHUB_WORKSPACE"
+          else
+            echo "::error::No ZIP and no settings.gradle(.kts) found in the repository."
+            exit 1
+          fi
+
+          SETTINGS="$(find "$SEARCH" -maxdepth 4 \( -name settings.gradle.kts -o -name settings.gradle \) -not -path '*/__MACOSX/*' | head -n 1 || true)"
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::settings.gradle(.kts) not found inside the project."
+            exit 1
+          fi
+          DIR="$(dirname "$SETTINGS")"
+          echo "Project directory: $DIR"
+          ls -la "$DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$(grep -E '^APP_VERSION_NAME=' "${{ steps.prep.outputs.dir }}/gradle.properties" 2>/dev/null | head -n1 | cut -d= -f2 || true)"
+          echo "name=${V:-0.0.0}" >> "$GITHUB_OUTPUT"
+
+      # ---------- 2. Окружение ----------
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+          build-root-directory: ${{ steps.prep.outputs.dir }}
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -uo pipefail
+          SDKM="${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools/latest/bin/sdkmanager"
+          if [ -x "$SDKM" ]; then
+            yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+            "$SDKM" "platforms;android-35" "build-tools;34.0.0" >/dev/null 2>&1 || true
+          else
+            echo "sdkmanager not found, relying on the preinstalled SDK"
+          fi
+
+      # ---------- 3. Сборка ----------
+      - name: Build debug APK
+        shell: bash
+        run: gradle -p "${{ steps.prep.outputs.dir }}" --no-daemon --stacktrace :app:assembleDebug
+
+      # Проверки не блокируют выдачу APK, но их результат виден в логах и отчётах.
+      - name: Unit tests (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: gradle -p "${{ steps.prep.outputs.dir }}" --no-daemon :app:testDebugUnitTest
+
+      - name: Android Lint (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: gradle -p "${{ steps.prep.outputs.dir }}" --no-daemon :app:lintDebug
+
+      - name: Build signed release APK (only if secrets are set)
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ] || [ -z "${KEYSTORE_PASSWORD:-}" ] || [ -z "${KEY_ALIAS:-}" ] || [ -z "${KEY_PASSWORD:-}" ]; then
+            echo "::notice::Release signing skipped: signing secrets are not set. Debug APK is built."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          export KEYSTORE_PATH="$RUNNER_TEMP/release.jks"
+          gradle -p "${{ steps.prep.outputs.dir }}" --no-daemon :app:assembleRelease
+          rm -f "$RUNNER_TEMP/release.jks"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      # ---------- 4. Результат ----------
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${{ steps.prep.outputs.dir }}/app/build/outputs/apk"
+          mkdir -p dist
+          DEBUG_APK="$(find "$OUT/debug" -name '*.apk' | head -n 1 || true)"
+          if [ -z "$DEBUG_APK" ]; then echo "::error::Debug APK was not produced"; exit 1; fi
+          cp "$DEBUG_APK" dist/AeroManager-debug.apk
+          if [ "${{ steps.release.outputs.signed }}" = "true" ]; then
+            REL_APK="$(find "$OUT/release" -name '*.apk' | head -n 1 || true)"
+            if [ -z "$REL_APK" ]; then echo "::error::Release APK was not produced"; exit 1; fi
+            cp "$REL_APK" dist/AeroManager-release.apk
+          fi
+          ls -l dist
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AeroManager-v${{ steps.version.outputs.name }}-build${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-build${{ github.run_number }}
+          path: |
+            ${{ steps.prep.outputs.dir }}/app/build/reports/
+            ${{ steps.prep.outputs.dir }}/app/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    name: GitHub Release
+    # Только для тегов v* и только если собран ПОДПИСАННЫЙ APK.
+    if: startsWith(github.ref, 'refs/tags/v') && needs.build.outputs.signed == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: AeroManager-v*
+          merge-multiple: true
+      - name: Name APK with tag
+        run: mv dist/AeroManager-release.apk "dist/AeroManager-${GITHUB_REF_NAME}.apk"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AeroManager-${{ github.ref_name }}.apk
+          generate_release_notes: true
